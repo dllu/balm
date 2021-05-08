@@ -24,26 +24,50 @@ def plotmatch(img1, img2, pts1, pts2, matches):
     for m1, m2 in matches:
         p1 = (int(pts1[0, m1]), int(pts1[1, m1]))
         p2 = (int(pts2[0, m2]), int(pts2[1, m2] + 128))
-        cv2.line(img, p1, p2, [255, 0, 100], thickness=2)
+        cv2.line(img, p1, p2, [255, 0, 200], thickness=1)
     return img
 
 
-def plotmatchbev(xyz1, xyz2, pts1, pts2, matches):
-    img = np.zeros((2048, 2048))
+def plotmatchbev(xyz1, xyz2, pts1, pts2, ts1, ts2, matches, odom):
+    img = np.zeros((2048, 2048, 3), dtype='uint8')
     for i, mm in enumerate(matches):
         m1, m2 = mm
         x1, y1 = int(pts1[0, m1]), int(pts1[1, m1])
         x2, y2 = int(pts2[0, m2]), int(pts2[1, m2])
 
-        p1 = xyz1[y1, x1] * 20
-        p2 = xyz2[y2, x2] * 20
+        t1 = (int(ts1[y1, x1]) - int(ts0)) / 1e9
+        t2 = (int(ts2[y2, x2]) - int(ts0)) / 1e9
+
+        p1 = xyz1[y1, x1]
+        p2 = xyz2[y2, x2]
+
         if np.linalg.norm(p1 == 0):
             continue
         if np.linalg.norm(p2 == 0):
             continue
+
+        homo1 = se3exp(odom * t1)
+        homo2 = se3exp(odom * t2)
+        moved_p1 = homo1[:3, :3] @ p1 + homo1[:3, 3]
+        moved_p2 = homo2[:3, :3] @ p2 + homo2[:3, 3]
+
+        if np.linalg.norm(moved_p1 - moved_p2) > 1:
+            continue
+
         try:
-            cv2.line(img, (int(p1[0] + 1024), int(p1[1] + 1024)),
-                     (int(p2[0] + 1024), int(p2[1] + 1024)), [255, 0, 100],
+            p1 *= 20
+            p2 *= 20
+            moved_p1 *= 20
+            moved_p2 *= 20
+            p1 += 1024
+            p2 += 1024
+            moved_p1 += 1024
+            moved_p2 += 1024
+            cv2.line(img, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])),
+                     [100, 0, 255],
+                     thickness=1)
+            cv2.line(img, (int(moved_p1[0]), int(moved_p1[1])),
+                     (int(moved_p2[0]), int(moved_p2[1])), [0, 255, 100],
                      thickness=1)
         except:
             pass
@@ -57,16 +81,21 @@ def skewsym(a):
 
 def se3exp(xi):
     out = np.identity(4)
-    out[:3, :3] = Rotation.from_rotvec(xi[:3].T).as_matrix()
-    out[:3, 3] = xi[3:].T
+    out[:3, :3] = Rotation.from_rotvec(xi[:3, 0]).as_matrix()
+    out[:3, 3] = xi[3:, 0]
     return out
 
 
-def low_latency_odometry(xyz1, xyz2, pts1, pts2, ts1, ts2, matches, ts0):
+def se3log(homo):
+    out = np.zeros((6, 1))
+    out[3:, 0] = homo[:3, 3]
+    out[:3, 0] = Rotation.from_matrix(homo[:3, :3]).as_rotvec()
+    return out
 
-    odom = np.zeros((6, 1))
 
-    for it in range(10):
+def low_latency_odometry(xyz1, xyz2, pts1, pts2, ts1, ts2, matches, ts0, odom):
+
+    for it in range(5):
         jacobian = np.zeros((len(matches) * 3, 6))
         residual = np.zeros((len(matches) * 3, 1))
         for i, mm in enumerate(matches):
@@ -89,7 +118,7 @@ def low_latency_odometry(xyz1, xyz2, pts1, pts2, ts1, ts2, matches, ts0):
             moved_p1 = homo1[:3, :3] @ p1 + homo1[:3, 3]
             moved_p2 = homo2[:3, :3] @ p2 + homo2[:3, 3]
 
-            if np.linalg.norm(moved_p1 - moved_p2) > 1:
+            if np.linalg.norm(moved_p1 - moved_p2) > 0.5:
                 continue
 
             block = np.zeros((3, 6))
@@ -99,7 +128,7 @@ def low_latency_odometry(xyz1, xyz2, pts1, pts2, ts1, ts2, matches, ts0):
             residual[(3 * i):(3 * i + 3), :] = np.array([moved_p1 - moved_p2
                                                          ]).T
         update = np.linalg.solve(jacobian.T @ jacobian, -jacobian.T @ residual)
-        odom += update
+        odom = se3log(se3exp(update) @ se3exp(odom))
         print('update', np.linalg.norm(residual))
     print(odom)
     return odom
@@ -128,6 +157,10 @@ orb = cv2.ORB_create()
 
 prev_img = None
 prev_ts = None
+
+
+odom = np.zeros((6, 1))
+odom_out = []
 with closing(client.Scans(source)) as stream:
     for scan in stream:
         if frame == 0:  # first frame usually incomplete garbage
@@ -175,18 +208,21 @@ with closing(client.Scans(source)) as stream:
         matches = match(desc, zoo_desc)
         mimg = plotmatch(img, prev_img, pts, zoo_pts, matches)
 
-        bimg = plotmatchbev(xyz_destaggered, prev_xyz, pts, zoo_pts, matches)
+        odom = low_latency_odometry(xyz_destaggered, prev_xyz, pts, zoo_pts,
+                                    ts, prev_ts, matches, ts0, odom)
+        odom_out.append(' '.join(str(s) for s in list(odom[:,0])))
+        bimg = plotmatchbev(xyz_destaggered, prev_xyz, pts, zoo_pts, ts,
+                            prev_ts, matches, odom)
         cv2.imwrite('output_{:06}.png'.format(frame), bimg)
 
-        #odom = low_latency_odometry(xyz_destaggered, prev_xyz, pts, zoo_pts,
-        #ts, prev_ts, matches, ts0)
-
-        #zoo_desc = desc
-        #zoo_pts = pts
+        zoo_desc = desc
+        zoo_pts = pts
         frame += 1
-        #prev_img = img
-        #prev_ts = ts
-        #prev_xyz = xyz_destaggered
+        prev_img = img
+        prev_ts = ts
+        prev_xyz = xyz_destaggered
 
-        cv2.imshow("img", bimg)
+        cv2.imshow("bev matches", bimg)
+        cv2.imshow("matches", mimg)
         key = cv2.waitKey(1) & 0xFF
+        open('odom.txt', 'w').write('\n'.join(odom_out))
